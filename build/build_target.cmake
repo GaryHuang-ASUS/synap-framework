@@ -220,7 +220,7 @@ function(build_target TARGET_NAME)
             -DVSSDK_DIR:PATH=${VSSDK_DIR}
             -DSOC:STRING=${SOC}
             -DVIP_SDK_DIR:PATH=${CMAKE_INSTALL_PREFIX}
-            -DSYNAP_TOOLKIT_DIR:PATH=${FRAMEWORK_DIR}/toolkit
+            -DSYNAP_TOOLKIT_DIR:PATH=${FRAMEWORK_DIR}/../toolkit
             -DCMAKE_INSTALL_PREFIX:STRING=${CMAKE_INSTALL_PREFIX}
             -DCMAKE_INSTALL_MESSAGE:STRING=LAZY)
         ExternalProject_Add(models
