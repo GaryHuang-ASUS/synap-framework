@@ -77,6 +77,7 @@ int main(int argc, char **argv)
 
     // Init Sublima processor
     Sublima sublima;
+    cout << "Initializing Sublima... with hdrjson: " << hdrjson << endl;
     if (!sublima.init(lut, model, meta, hdrjson)) {
         cerr << "Failed to initialize Sublima" << endl;
         return 1;
@@ -84,14 +85,13 @@ int main(int argc, char **argv)
 
     if (hdr_disable) {
         sublima.set_hdr(false);
-	cout << "disable hdr" << endl;
     }
 
     if (only_y) {
         sublima.set_only_y(true);
-	cout << "only Y processing, no UV model processing" << endl;
     }
-
+    cout << "HDR processing: " << (hdr_disable ? "OFF" : only_y ? "Y-ONLY" : "ON") << endl;
+    
     // Perform conversion
     const uint32_t width = 1920, height = 1080;
     const uint32_t y_size = width * height;
@@ -102,7 +102,8 @@ int main(int argc, char **argv)
             cerr << "Failed to load image file: " << input_filename << endl;
             return 1;
         }
-        sublima.process(yuv_input.data(), yuv_input.data() + y_size, nv15.data(), nv15.data() + y_size * 5 / 4, width, height);
+        sublima.process(yuv_input.data(), yuv_input.data() + y_size, nv15.data(),
+                        nv15.data() + y_size * 5 / 4, width, height, 0);
     }
 
     if (r > 0) {

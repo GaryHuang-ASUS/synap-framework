@@ -146,11 +146,12 @@ void from_json(const json& j, TensorAttributes& p) {
         LOGE << "Unexpected value for 'type' field: " << j.at("type");
     }
 
-    if (p.layout == Layout::nhwc && p.shape.size() == 4 && p.shape[1] <= 4 && p.shape[3] > 4) {
+    if (p.layout == Layout::nhwc && p.shape.size() == 4 && p.shape[1] <= 4 && p.shape[2] > 4 && p.shape[3] > 4) {
         // Check layout matches shape.
         // This was happening when the transpose layer is removed, see:
         // https://support.verisilicon.com/projects/SVIPSW/issues/SVIPSW-59
         // but this case has been fixed in converter.py.
+        // See also https://synaptics.atlassian.net/browse/IOTMMSQA-14206
         LOGW << "Tensor " << p.name << " has layout nhwc bus shape seems to be nchw";
     }
 }

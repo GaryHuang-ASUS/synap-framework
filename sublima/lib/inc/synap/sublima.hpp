@@ -93,8 +93,10 @@ public:
     /// @param nv15uv: UV plane of the NV15 image
     /// @param width: image width
     /// @param height: image height
+    /// @param nv15_pad: paddding bytes to be added at the end of each row in the NV15 image
     /// @return true if processing was successful
-    bool process(const uint8_t* nv12y, const uint8_t* nv12uv, uint8_t* nv15y, uint8_t* nv15uv, uint32_t width, uint32_t height);
+    bool process(const uint8_t* nv12y, const uint8_t* nv12uv, uint8_t* nv15y, uint8_t* nv15uv,
+                 uint32_t width, uint32_t height, uint32_t nv15_pad);
 
     /// Enable/Disable HDR
     /// @param enable: true to enable HDR output, false to just convert to NV15

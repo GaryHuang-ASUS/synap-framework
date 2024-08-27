@@ -46,6 +46,7 @@
 #include <fstream>
 #include <future>
 #include "json.hpp"
+#include <algorithm>
 
 using namespace std;
 using json = nlohmann::ordered_json;
@@ -100,11 +101,6 @@ static void from_json(const json& j, Sublima::JsonHDRInfo& p)
 
 
 struct Sublima::Private {
-    //
-    inline void to_nv15(uint16_t data0, uint16_t data1, uint16_t data2, uint16_t data3, uint8_t*& nv15);
-
-    void convert_nv15(const uint8_t* data, uint8_t* nv15, uint32_t count);
-
     // Read LUT2D from a CSV file
     static std::vector<uint16_t> load_lut(std::string file_path);
 
@@ -112,11 +108,14 @@ struct Sublima::Private {
     inline uint16_t lut(uint8_t y, uint8_t median) const;
 
     // Convert NCHW 16bits data to packed 10bits NV15 data
-    void convert_nchw_nv15(const uint16_t *data, uint8_t* nv15, uint32_t count);
+    void convert_nchw_nv15(const uint16_t *data, uint8_t* nv15, uint32_t width, uint32_t height, uint32_t nv15_pad);
 
     // Convert 8bits Y plane to 16bits by applying LUT, then pack to 10bits NV15 data
-    void convert_lut_nv15(const uint8_t *data, uint8_t* nv15, uint32_t count, uint8_t median);
-
+    void convert_lut_nv15(const uint8_t *data, uint8_t* nv15, uint32_t width, uint32_t height, uint32_t nv15_pad, uint8_t median);
+    
+    // Convert 8bits data to packed 10bits NV15 data by inserting 2 LSB at 0 to each pixel
+    void convert_nv15(const uint8_t* data, uint8_t* nv15, uint32_t width, uint32_t height, uint32_t nv15_pad);
+    
     // Assign the input tensor with the Y, UV planes of the NV12 image and the previous median value
     // returns the median of the Y plane
     uint8_t assign_tensor(const uint8_t* nv12y, const uint8_t* nv12uv, uint16_t* data, uint32_t width, uint32_t height);
@@ -131,14 +130,18 @@ struct Sublima::Private {
     std::vector<uint32_t> _histogram = std::vector<uint32_t>(k_lum_values);
     Sublima::Timings _timings{};
     bool _only_y{false};
-    uint32_t line_pixels{};
     Sublima::JsonHDRInfo _hdrinfo{};
-
 };
 
+// Look-up table used to clip UV values
+static uint8_t s_clip_table[256];
 
 Sublima::Sublima(): d{new Private}
 {
+    // Init clip table
+    for (int i = 0; i < sizeof(s_clip_table) / sizeof(s_clip_table[0]); i++) {
+        s_clip_table[i] = std::clamp(i, 16, 240);
+    }
 }
 
 
@@ -270,6 +273,14 @@ uint16_t Sublima::Private::lut(uint8_t y, uint8_t median) const {
 }
 
 
+inline uint16_t uv_clip(uint8_t val)
+{
+    // Use a look-up table to clip UV values. This is faster than using std::clamp on each value
+    // and much faster than using NEON
+    return s_clip_table[val];
+}
+
+
 uint8_t Sublima::Private::assign_tensor(const uint8_t* nv12y, const uint8_t* nv12uv, uint16_t* data, uint32_t width, uint32_t height)
 {
     Timer t;
@@ -304,87 +315,93 @@ uint8_t Sublima::Private::assign_tensor(const uint8_t* nv12y, const uint8_t* nv1
     const uint8_t* uv = nv12uv;
     for (const uint8_t* const end = &uv[quarter_pixels * 2]; uv < end; ) {
         // Unrolling the loop a bit improves performances considerably
-        *u16++ = *uv++;
-        *v16++ = *uv++;
-        *u16++ = *uv++;
-        *v16++ = *uv++;
+        *u16++ = uv_clip(*uv++);
+        *v16++ = uv_clip(*uv++);
+        *u16++ = uv_clip(*uv++);
+        *v16++ = uv_clip(*uv++);
     }
-
     _timings.assign += t.get();
     return median;
 }
 
-void Sublima::Private::to_nv15(uint16_t data0, uint16_t data1, uint16_t data2, uint16_t data3, uint8_t*& nv15)
+inline void to_nv15(uint16_t data0, uint16_t data1, uint16_t data2, uint16_t data3, uint8_t*& nv15)
 {
     *nv15++ = data0 & 0xff;
     *nv15++ = ((data0 >> 8) & 0x03) + ((data1 & 0x3f) << 2);
     *nv15++ = ((data1 >> 6) & 0x0f) + ((data2 & 0x0f) << 4);
     *nv15++ = ((data2 >> 4) & 0x3f) + ((data3 & 0x03) << 6);
     *nv15++ = (data3 >> 2) & 0xff;
-
-    line_pixels += 5;
-    line_pixels % 2400 == 0 ? nv15 += 32 : nv15;
 }
 
-void Sublima::Private::convert_nv15(const uint8_t* data, uint8_t* nv15, uint32_t count)
+void Sublima::Private::convert_nv15(const uint8_t* data, uint8_t* nv15, uint32_t width, uint32_t height, uint32_t nv15_pad)
 {
-    line_pixels = 0;
+    const uint32_t count = width * height;
     const uint8_t* d = &data[0];
     const uint8_t* end = &data[count];
     while (d < end) {
-        const uint16_t data0 = *d++ << 2;
-        const uint16_t data1 = *d++ << 2;
-        const uint16_t data2 = *d++ << 2;
-        const uint16_t data3 = *d++ << 2;
-        to_nv15(data0, data1, data2, data3, nv15);
+        for (uint32_t x = 0; x < width; x += 4) {
+            const uint16_t data0 = *d++ << 2;
+            const uint16_t data1 = *d++ << 2;
+            const uint16_t data2 = *d++ << 2;
+            const uint16_t data3 = *d++ << 2;
+            to_nv15(data0, data1, data2, data3, nv15);
+        }
+        nv15 += nv15_pad;
     }
 }
 
 
-void Sublima::Private::convert_nchw_nv15(const uint16_t* data, uint8_t* nv15, uint32_t count)
+
+void Sublima::Private::convert_nchw_nv15(const uint16_t* data, uint8_t* nv15, uint32_t width, uint32_t height, uint32_t nv15_pad)
 {
     Timer t;
-    line_pixels = 0;
+    const uint32_t count = width * height;
     const uint16_t* u = &data[0];
     const uint16_t* v = &data[count / 2];
     const uint16_t* end = &data[count];
     while (v < end) {
-        const uint16_t data0 = *u++;
-        const uint16_t data1 = *v++;
-        const uint16_t data2 = *u++;
-        const uint16_t data3 = *v++;
-        to_nv15(data0, data1, data2, data3, nv15);
+        for (uint32_t x = 0; x < width; x += 4) {
+            const uint16_t data0 = *u++;
+            const uint16_t data1 = *v++;
+            const uint16_t data2 = *u++;
+            const uint16_t data3 = *v++;
+            to_nv15(data0, data1, data2, data3, nv15);
+        }
+        nv15 += nv15_pad;
     }
 
     _timings.nv15uv += t.get();
 }
 
 
-void Sublima::Private::convert_lut_nv15(const uint8_t* data, uint8_t* nv15, uint32_t count, uint8_t median)
+void Sublima::Private::convert_lut_nv15(const uint8_t* data, uint8_t* nv15, uint32_t width, uint32_t height, uint32_t nv15_pad, uint8_t median)
 {
     Timer t;
-    line_pixels = 0;
+    const uint32_t count = width * height;
     const uint8_t* end = &data[count];
     while (data < end) {
-        const uint16_t data0 = lut(*data++, median);
-        const uint16_t data1 = lut(*data++, median);
-        const uint16_t data2 = lut(*data++, median);
-        const uint16_t data3 = lut(*data++, median);
-        to_nv15(data0, data1, data2, data3, nv15);
+        for (uint32_t x = 0; x < width; x += 4) {
+            const uint16_t data0 = lut(*data++, median);
+            const uint16_t data1 = lut(*data++, median);
+            const uint16_t data2 = lut(*data++, median);
+            const uint16_t data3 = lut(*data++, median);
+            to_nv15(data0, data1, data2, data3, nv15);
+        }
+        nv15 += nv15_pad;
     }
-    
     _timings.nv15y += t.get();
 }
 
 
 bool Sublima::process(const uint8_t* nv12y, const uint8_t* nv12uv, uint8_t* nv15y, uint8_t* nv15uv,
-                      uint32_t width, uint32_t height) {
+                      uint32_t width, uint32_t height, uint32_t nv15_pad) {
+    LOGV << "Sublima processing with nv15_pad: " << nv15_pad;
     Timer tot;
     const uint32_t total_pixels = width * height;
     if (!d->_hdr) {
         LOGV << "Sublima HDR not emabled, converting to NV15 only";
-        d->convert_nv15(nv12y, nv15y, total_pixels);
-        d->convert_nv15(nv12uv, nv15uv, total_pixels / 2);
+        d->convert_nv15(nv12y, nv15y, width, height, nv15_pad);
+        d->convert_nv15(nv12uv, nv15uv, width, height / 2, nv15_pad);
 
         d->_timings.tot += tot.get();
         d->_timings.cnt += 1;
@@ -410,7 +427,7 @@ bool Sublima::process(const uint8_t* nv12y, const uint8_t* nv12uv, uint8_t* nv15
     });
 
     // In the meantime, apply the LUT to the Y plane and convert to NV15
-    d->convert_lut_nv15(nv12y, nv15y, total_pixels, median);
+    d->convert_lut_nv15(nv12y, nv15y, width, height, nv15_pad, median);
 
     // Wait for inference to complete, then convert the UV planes to NV15
     if (!success.get()) {
@@ -419,7 +436,7 @@ bool Sublima::process(const uint8_t* nv12y, const uint8_t* nv12uv, uint8_t* nv15
     }
 
     if (!d->_only_y) {
-        d->convert_nchw_nv15(static_cast<uint16_t*>(d->_network.outputs[0].data()), nv15uv, total_pixels / 2);
+        d->convert_nchw_nv15(static_cast<uint16_t*>(d->_network.outputs[0].data()), nv15uv, width, height / 2, nv15_pad);
     }
 
     d->_timings.tot += tot.get();

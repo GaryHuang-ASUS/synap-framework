@@ -36,6 +36,6 @@ set(name "synap_cli_sublima")
 
 add_executable(${name} main.cpp)
 
-target_link_libraries(${name} PRIVATE synap_app synapnb synap_sublima)
+target_link_libraries(${name} PRIVATE synap_sublima synap_app synapnb)
 
 install(TARGETS ${name})
