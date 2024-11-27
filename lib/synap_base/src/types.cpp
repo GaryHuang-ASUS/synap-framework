@@ -45,6 +45,31 @@ namespace synaptics {
 namespace synap {
 
 
+Mask::Mask() = default;
+
+Mask::Mask(uint32_t _mask_w, uint32_t _mask_h)
+: _width(_mask_w), _height(_mask_h)
+{
+    _data.resize(_mask_w * _mask_h);
+    LOGV << "Reserved " << _data.capacity() * sizeof(float) << " bytes for mask";
+}
+
+const float* Mask::data() const
+{
+    if (_data.empty()) {
+        LOGE << "Mask has no data";
+        return nullptr;
+    }
+    return _data.data();
+}
+
+
+void Mask::set_value(uint32_t row, uint32_t col, float& val)
+{
+    _data[row * _width + col] = val;
+}
+
+
 size_t Shape::item_count() const
 {
     size_t c = 1;

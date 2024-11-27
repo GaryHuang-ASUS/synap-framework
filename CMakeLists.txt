@@ -129,6 +129,12 @@ if(ENABLE_SUBLIMA AND CMAKE_CROSSCOMPILING)
     add_subdirectory(sublima/cli)
 endif()
 
+option(ENABLE_SR_SUBLIMA "Enable B<>COM SR Sublima support" ON)
+
+if(ENABLE_SR_SUBLIMA AND CMAKE_CROSSCOMPILING)
+    add_subdirectory(srsublima/lib)
+    add_subdirectory(srsublima/cli)
+endif()
 if(ENABLE_TEST)
     add_subdirectory(test)
 endif()

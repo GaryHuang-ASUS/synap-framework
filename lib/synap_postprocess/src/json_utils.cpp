@@ -49,6 +49,7 @@ using json = nlohmann::json;
 
 void to_json(json& j, const Dim2d& p);
 void to_json(json& j, const Landmark& p);
+void to_json(json& j, const Mask& p);
 void to_json(json& j, const Rect& p);
 void to_json(json& j, const Detector::Result::Item& p);
 void to_json(json& j, const Detector::Result& p);
@@ -66,6 +67,14 @@ void to_json(json& j, const Landmark& p)
     j = json{{"x", p.x}, {"y", p.y}, {"z", p.z}, {"visibility", p.visibility}};
 }
 
+void to_json(json& j, const Mask& mask)
+{
+    j = json{
+        {"width", mask.width()},
+        {"height", mask.height()},
+        {"data", mask.buffer()}
+    };
+}
 
 void to_json(json& j, const Rect& p)
 {
@@ -83,7 +92,8 @@ void to_json(json& j, const Detector::Result::Item& p)
         {"class_index", p.class_index},
         {"confidence", p.confidence},
         {"bounding_box", p.bounding_box},
-        {"landmarks", lms }
+        {"landmarks", lms },
+        {"mask", p.mask}
     };
 }
 

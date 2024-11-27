@@ -35,97 +35,70 @@
 ///
 /// Sublima HDR image processing
 ///
-#pragma once
+
 #include <memory>
 #include <string>
 #include <vector>
-
+#include "synap/sublima.hpp"
 
 namespace synaptics {
 namespace synap {
 
 /// Convert SDR to HDR using Sublima algorithm
-class Sublima {
+class SrSublima {
 public:
-    Sublima();
-    ~Sublima();
+    SrSublima();
+    ~SrSublima();
 
-    struct JsonHDRInfo {
-        uint32_t type{1}; // 1: HDR10, 2: HLG
-        float PrimaryChromaticityR_X;
-        float PrimaryChromaticityR_Y;
-        float PrimaryChromaticityG_X;
-        float PrimaryChromaticityG_Y;
-        float PrimaryChromaticityB_X;
-        float PrimaryChromaticityB_Y;
-        float WhitePointChromaticity_X;
-        float WhitePointChromaticity_Y;
-        float LuminanceMax;
-        float LuminanceMin;
 
-        uint32_t MatrixCoefficients;
-        uint32_t TransferCharacteristics;
-        uint32_t ColorPrimaries;
-
-        uint32_t MaxCLL;
-        uint32_t MaxFALL;
-    };
-
-    /// Initialize the Sublima HDR processing
+    /// Initialize the SrSublima processing
     /// @param lut2d: LUT2D file path (the LUT file is in CSV format)
-    /// @param model: model file path
-    /// @param meta: meta file path (deprecated, will be removed)
+    /// @param slmodel: sublima model file path
+    /// @param srmodel:super res model file path
+    /// @param slmeta: sublima meta file path (deprecated, will be removed)
     /// @param hdrjson: hdr json parameters file path
+    /// @param srmeta: super res model meta file path
+    /// @param hdr_disable: Enable/Disable HDR
+    /// @param only_y: Enable/Disable UV Conversion
     /// @return true if initialization was successful
     bool init(const std::string& lut2d,
-              const std::string& model, const std::string& meta = "",
-              const std::string& hdrjson = "");
+              const std::string& slmodel, const std::string& srmodel, const std::string& slmeta = "",
+              const std::string& hdrjson = "", const std::string& srmeta = "", bool hdr_disable = false, bool only_y = false);
 
 
-    /// Get hdr parameter information
-    /// @return hdr parameter
-    JsonHDRInfo hdrinfo();
-    
     /// Process the NV12 image to convert it to HDR
     /// @param nv12y: Y plane of the NV12 image
     /// @param nv12uv: UV plane of the NV12 image
     /// @param nv15y: Y plane of the NV15 image
     /// @param nv15uv: UV plane of the NV15 image
-    /// @param width: image width
-    /// @param height: image height
-    /// @param nv15_pad: paddding bytes to be added at the end of each row in the NV15 image
+    /// @param width_sr: SuperRes image width
+    /// @param height_sr: SuperRes image height
+    /// @param width_sl: Sublima image width
+    /// @param height_sl: Sublima image height
     /// @return true if processing was successful
+    /// @param nv15_pad: paddding bytes to be added at the end of each row in the NV15 image
     bool process(const uint8_t* nv12y, const uint8_t* nv12uv, uint8_t* nv15y, uint8_t* nv15uv,
-                 uint32_t width, uint32_t height, uint32_t nv15_pad);
+                 uint32_t width_sr, uint32_t height_sr, uint32_t width_sl, uint32_t height_sl, uint32_t nv15_pad = 0);
 
-    /// Enable/Disable HDR
-    /// @param enable: true to enable HDR output, false to just convert to NV15
-    /// @return true if success
-    bool set_hdr(bool enable);
-
-    /// Enable/Disable UV Conversion
-    /// @param enable: true to disable UV conversion, only Y channel will be processed
-    /// @return true if success
-    bool set_only_y(bool enable);
+    /// Get sublima hdr parameter information
+    /// @return hdr parameter
+    Sublima::JsonHDRInfo hdrinfo();
 
     /// Get total processing timings (for debug)
     struct Timings {
         int assign;
         int infer;
-        int nv15y;
-        int nv15uv;
         int tot;
         int cnt;
     };
-    Timings* timings();
-    
+    Timings* superResTimings();
+    Sublima::Timings* sublimaTimings();
+
 private:
     // Implementation details
     struct Private;
-    std::unique_ptr<Private> d;
+    std::unique_ptr<Private> p;
 };
 
 }  // namespace synap
 }  // namespace synaptics
-
-

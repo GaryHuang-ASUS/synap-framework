@@ -39,6 +39,7 @@
 ///
 
 #include "synap/tensor.hpp"
+#include "synap/types.hpp"
 #include <vector>
 #include <memory>
 
@@ -71,6 +72,9 @@ public:
             /// One entry for each landmark.
             /// Empty if no landmark available.
             std::vector<Landmark> landmarks;
+
+            /// Segment mask for instance segmentation models
+            Mask mask;
         };
 
         /// True if detection successful, false if detection failed.

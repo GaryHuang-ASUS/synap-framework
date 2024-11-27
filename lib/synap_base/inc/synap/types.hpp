@@ -124,6 +124,23 @@ struct Landmark {
 };
 
 
+/// Segment mask
+struct Mask {
+    Mask();
+    Mask(uint32_t width, uint32_t height);
+    inline uint32_t width() const { return _width; }
+    inline uint32_t height() const { return _height; }
+    inline operator bool() const { return !(_data.empty()); }
+    const std::vector<float>& buffer() const { return _data; }
+    const float* data() const;
+    void set_value(uint32_t row, uint32_t col, float& val);
+private:
+    std::vector<float> _data;
+    uint32_t _width {0};
+    uint32_t _height {0};
+};
+
+
 /// Bounding box rectangle
 struct Rect {
     Dim2d origin;  /// Top-left corner of the bounding box

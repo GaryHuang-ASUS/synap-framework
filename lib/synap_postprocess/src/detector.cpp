@@ -42,6 +42,7 @@
 #include <algorithm>
 #include <cmath>
 #include <numeric>
+#include <thread>
 
 #if SYNAP_NB_NEON
 #include <arm_neon.h>
@@ -63,12 +64,22 @@ struct Box {
     Pt tl, br;      // Top-left and Bottom-right corners
 };
 
+struct MaskData {
+    uint32_t mask_features;
+    uint32_t mask_width;
+    uint32_t mask_height;
+    const vector<float> mask_score_vec;
+
+    inline operator bool() const { return !mask_score_vec.empty(); }
+};
+
 /// Detection info
 struct Detection {
     float score;
     int class_index;
     Box box;
     vector<Landmark> lm;
+    MaskData mask_data;
 };
 
 
@@ -84,6 +95,7 @@ public:
     int index_base() const { return _index_base; }
     int landmarks_count() const { return _landmarks_count; }
     int visibility() const { return _visibility; }
+    uint32_t n_threads() const { return _n_threads; }
     bool valid() const { return _valid; }
     bool validate() { _valid = true; return true; }
 
@@ -99,6 +111,9 @@ private:
 
     // Visibility associated with the points
     int _visibility{};
+
+    // Number of threads used for parallel processing
+    uint32_t _n_threads{};
 };
 class DetectorBoxesScores : public Detector::Impl {
 public:
@@ -178,6 +193,12 @@ public:
     vector<Detection> get_detections(float min_score, const Tensors& tensors, Dim2d in_dim) override;
 };
 
+class DetectorYolov8Seg : public DetectorYoloBase {
+
+public:
+    vector<Detection> get_detections(float min_score, const Tensors& tensors, Dim2d in_dim) override;
+};
+
 class DetectorYolov5Pyramid : public Detector::Impl {
 public:
     bool init(const Tensors& tensors) override;
@@ -207,6 +228,128 @@ private:
     size_t _y_axis{};      // Index of y-axis in the tensor shape
     OutLayout _ol{};       // Output layout
 };
+
+
+#if SYNAP_NB_NEON
+/// @brief Uses NEON intrinsics to compute dot product along the last axes, producing output of shape [h, w]
+/// @param mat_1 pointer to first matrix, must have shape [n]
+/// @param mat_2 pointer to second matrix, must have shape [h, w, n]
+/// @param output Mask object for storing result
+/// @param n size of last dimension in both matrices
+/// @param h number of rows in second matrix
+/// @param w number of columns in second matrix
+/// @param start_row used to select subset of second matrix
+/// @param end_row used to select subset of second matrix
+static void dot_product_neon(const float* mat_1, const float* mat_2, Mask& output, int n, int h, int w, int start_row, int end_row) 
+{
+    for (int i = start_row; i < end_row; ++i) {
+        for (int j = 0; j < w; ++j) {
+            float32x4_t sum_vec = vdupq_n_f32(0.0f);  // creates 128-bit vector [0.0f, 0.0f, 0.0f, 0.0f]
+            int k = 0;
+            
+            /* use neon intrinsics to process 4 elements at a time*/
+            for (; k <= n - 4; k += 4) {
+                float32x4_t mat1_vec = vld1q_f32(mat_1 + k); // loads 128-bit vector [mat_1[k], mat_1[k+1], mat_1[k+2], mat_1[k+3]]
+                float32x4_t mat2_vec = vld1q_f32(mat_2 + i * w * n + j * n + k); // loads 128-bit vector [mat_2[i][j][k], mat_2[i][j][k+1], mat_2[i][j][k+2], mat_2[i][j][k+3]]
+                sum_vec = vmlaq_f32(sum_vec, mat1_vec, mat2_vec);  // multiply and accumulate 
+            }
+            /* 
+            sum all values in sum_vec by reducing through pairwise addition
+            equivalent  to:
+            float sum = vget_lane_f32(sum_vec, 0) + vget_lane_f32(sum_vec, 1) + vget_lane_f32(sum_vec, 2) + vget_lane_f32(sum_vec, 3);
+             */
+            float32x2_t sum_vec_low = vget_low_f32(sum_vec); // creates 64-bit vector [sum_vec[0], sum_vec[1]]
+            float32x2_t sum_vec_high = vget_high_f32(sum_vec);  // creates 64-bit vector [sum_vec[2], sum_vec[3]]
+            float32x2_t sum_half = vpadd_f32(sum_vec_low, sum_vec_high); // pair-wise addition, creates 64-bit vector [sum_vec[0] + sum_vec[1], sum_vec[2] + sum_vec[3]]
+            float sum = vget_lane_f32(vpadd_f32(sum_half, sum_half), 0); // pair-wise addtion, computes sum = (sum_vec[0] + sum_vec[1]) + (sum_vec[2] + sum_vec[3])
+
+            /* multiply and sum remaining elems */
+            for (; k < n; ++k) {
+                sum += mat_1[k] * mat_2[i * w * n + j * n + k];
+            }
+
+            output.set_value(i, j, sum);
+        }
+    } 
+}
+#endif
+
+/// @brief Computes dot product along the first or last axes, producing output of shape [h, w]
+/// @param mat_1 pointer to first matrix, must have shape [n] 
+/// @param mat_2 pointer to second matrix, must have shape [n, h, w] or [h, w, n]
+/// @param output Mask object for storing result
+/// @param n size of first or last dimension in both matrices
+/// @param h number of rows in second matrix
+/// @param w number of columns in second matrix
+/// @param start_row used to select subset of second matrix
+/// @param end_row used to select subset of second matrix 
+/// @param is_chw specifies whether second matrix is [n, h, w]
+static void dot_product(const float* mat_1, const float* mat_2, Mask& output, int n, int h, int w, int start_row, int end_row, bool is_chw)
+{
+    for (int i = start_row; i < end_row; ++i) {
+        for (int j = 0; j < w; ++j) {
+            float sum = 0.0f;
+            for (int k = 0; k < n; ++k) {
+                if (is_chw) {
+                    sum += mat_1[k] * mat_2[k * h * w + i * w + j];
+                } else {
+                    sum += mat_1[k] * mat_2[i * w * n + j * n + k];
+                }
+            }
+            output.set_value(i, j, sum);
+        }
+    }
+}
+
+/// @brief Calculates mask values via parallelized dot products + NEON intrinsics if available.
+/// @param mask_data Mask data from output0 of seg model
+/// @param mask_protos Mask prototypes from output1 of seg model
+/// @param n_threads Number of threads to use for parallel processing
+/// @param is_chw Whether mask protos have shape [n, h, w] or [h, w, n]
+/// @return A Mask object of shape [mask_data.mask_height, mask_data.mask_width]
+static Mask compute_masks_parallel(const MaskData& mask_data, const float* mask_protos, uint32_t n_threads, bool is_chw)
+{
+    vector<thread> threads;
+    uint32_t n = mask_data.mask_features;
+    uint32_t h = mask_data.mask_height;
+    uint32_t w = mask_data.mask_width;
+    Mask seg_mask {w, h};
+    if (n_threads == 0) {
+#if SYNAP_NB_NEON
+        // can't use NEON for [c, h, w] format as values of c aren't contiguous in memory
+        if (!is_chw)
+            dot_product_neon(mask_data.mask_score_vec.data(), mask_protos, seg_mask, n, h, w, 0, h);
+        else
+            dot_product(mask_data.mask_score_vec.data(), mask_protos, seg_mask, n, h, w, 0, h, is_chw);
+#else
+        dot_product(mask_data.mask_score_vec.data(), mask_protos, seg_mask, n, h, w, 0, h, is_chw);
+#endif
+        return seg_mask;
+    }
+    int rows_per_thread = h / n_threads;
+    int remaining_rows = h % n_threads;
+    int start_row = 0;
+    for (int i = 0; i < n_threads; ++i) {
+        int end_row = start_row + rows_per_thread + (i < remaining_rows ? 1 : 0);
+
+#if SYNAP_NB_NEON
+        // can't use NEON for [c, h, w] format as values of c aren't contiguous in memory
+        if (!is_chw)
+            threads.push_back(thread(dot_product_neon, mask_data.mask_score_vec.data(), mask_protos, ref(seg_mask), n, h, w, start_row, end_row));
+        else
+            threads.push_back(thread(dot_product, mask_data.mask_score_vec.data(), mask_protos, ref(seg_mask), n, h, w, start_row, end_row, is_chw));
+#else
+        threads.push_back(thread(dot_product, mask_data.mask_score_vec.data(), mask_protos, ref(seg_mask), n, h, w, start_row, end_row, is_chw));
+#endif
+        start_row = end_row;
+    }
+
+    for (auto& thread : threads) {
+        thread.join();
+    }
+
+    return seg_mask;
+}
 
 
 /// Determines whether the detection should be kept or not.
@@ -371,9 +514,22 @@ bool Detector::Impl::init(const Tensors& tensors)
     // Get visibility detected
     _visibility = format_parse::get_int(tensors[0].format(), "visibility", 0);
 
+    // Get number of threads to use for parallel processing
+    uint32_t hw_threads = thread::hardware_concurrency();
+    if (hw_threads == 0) {
+        LOGW << "Error determining hardware concurrency, parallel processing disabled";
+    } else {
+        _n_threads = (uint32_t) format_parse::get_int(tensors[0].format(), "pp_threads", hw_threads);
+        if (_n_threads > hw_threads) {
+            LOGW << "Hardware supports maximum " << hw_threads << " threads";
+            _n_threads = hw_threads;
+        }
+    }
+
     LOGI << "Detector class_index_base = " << _index_base;
     LOGI << "Detector landmarks = " << _landmarks_count;
     LOGI << "Detector visibility = " << _visibility;
+    LOGI << "Detector parallel processing threads = " << _n_threads;
     return true;
 }
 
@@ -765,6 +921,103 @@ vector<Detection> DetectorYolov8::get_detections(float min_score, const Tensors&
     return dv;
 }
 
+vector<Detection> DetectorYolov8Seg::get_detections(float min_score, const Tensors& tensors, Dim2d in_dim)
+{
+    struct RawDetection {
+        float x, y, w, h, sm_class_confidence[0];
+    };
+    Pt scale {_in_tensor_dim.x ? (float)in_dim.x / _in_tensor_dim.x : 1.0f,
+              _in_tensor_dim.y ? (float)in_dim.y / _in_tensor_dim.y : 1.0f};
+    Pt relative_scale {_out_bb_norm ? (float)in_dim.x : scale.x,
+              _out_bb_norm ? (float)in_dim.y : scale.y};
+
+    constexpr uint32_t bbox_data_len = 4;
+    const Tensor& output_0 = tensors[0];
+    const Tensor& output_1 = tensors[1];
+    const Shape& output_0_shape = output_0.shape();
+    const Shape& output_1_shape = output_1.shape();
+    const Layout& layout = output_0.layout();
+    uint32_t num_mask_features, mask_height, mask_width;
+
+    // check tensor information
+    if (output_0_shape.size() != 3 || output_0_shape[0] != 1) {
+        LOGE << output_0_shape.size() << " dimensions in Output1 shape, should be 3";
+        LOGE << "Invalid Output1 tensor shape";
+        return {};
+    }
+    if (output_1_shape.size() != 4 || output_1_shape[0] != 1) {
+        LOGE << output_1_shape.size() << " dimensions in Output2 shape, should be 4";
+        LOGE << "Invalid Output2 tensor shape";
+        return {};
+    }
+    if (layout == Layout::none) {
+        LOGE << "Invalid output tensor layout";
+        return {};
+    }
+    if (layout == Layout::nchw) {
+        num_mask_features = static_cast<uint32_t>(output_1_shape.at(1));
+        mask_height = static_cast<uint32_t>(output_1_shape.at(2));
+        mask_width = static_cast<uint32_t>(output_1_shape.at(3));
+    } else {
+        num_mask_features = static_cast<uint32_t>(output_1_shape.at(3));
+        mask_height = static_cast<uint32_t>(output_1_shape.at(1));
+        mask_width = static_cast<uint32_t>(output_1_shape.at(2));
+    }
+
+    // Check mask prototypes size
+    const size_t n_protos = output_1.item_count();
+    if (output_1.item_count() != num_mask_features * mask_height * mask_width) {
+        LOGE << "Mask prototypes size mismatch (" << n_protos << " != " << num_mask_features * mask_height * mask_width << ")";
+        return {};
+    }
+
+    LOGV << num_mask_features << " mask features";
+    LOGV << mask_height << " mask height";
+    LOGV << mask_width << " mask width";
+    
+    const int num_classes = output_0_shape.at(1) - (bbox_data_len + num_mask_features);
+    LOGV << num_classes << " classes";
+
+    const int detection_size = output_0_shape.at(1);
+    vector<float> detection_buf(detection_size);
+    vector<Detection> dv;
+
+    const float* data_ptr = output_0.as_float();
+    const int num_boxes = output_0_shape.at(2);
+    LOGV << "Detector boxes: " << num_boxes;
+
+    for (int i = 0; i < num_boxes; i++) {
+        for (int j = 0; j < detection_size; j++) {
+            detection_buf[j] = data_ptr[num_boxes*j + i];
+        }
+        const RawDetection* detection = reinterpret_cast<const RawDetection*>(detection_buf.data());
+        int class_idx = get_index_max(detection->sm_class_confidence, num_classes);
+        if (class_idx == -1) continue;
+        float class_score = detection->sm_class_confidence[class_idx];
+        // Overall confidence is too low
+        if (class_score < min_score) continue;
+    
+        // bounding box
+        Box box;
+        box.tl.x = (detection->x - detection->w / 2) * relative_scale.x;
+        box.tl.y = (detection->y - detection->h / 2) * relative_scale.y;
+        box.br.x = (detection->x + detection->w / 2) * relative_scale.x;
+        box.br.y = (detection->y + detection->h / 2) * relative_scale.y;
+
+        // landmarks (empty)
+        vector<Landmark> lms;
+
+        // segment mask data
+        const float* ms_ptr = detection->sm_class_confidence + num_classes;
+        const vector<float> mask_score_vec = vector<float>(ms_ptr, ms_ptr + num_mask_features);
+        MaskData mask_data {num_mask_features, mask_width, mask_height, mask_score_vec};
+
+        dv.push_back({class_score, class_idx, box, lms, mask_data});
+    }
+
+    return dv;
+}
+
 bool DetectorYolov5Pyramid::init(const Tensors& tensors)
 {
     if (!Detector::Impl::init(tensors)) {
@@ -1026,6 +1279,9 @@ bool Detector::init(const Tensors& tensors)
     else if (od_type == "yolov8"){
         d.reset(new DetectorYolov8);
     }
+    else if (od_type == "yolov8seg"){
+        d.reset(new DetectorYolov8Seg);
+    }
     else {
         LOGE << "Unknown object detection format: " << od_type;
         return false;
@@ -1050,9 +1306,16 @@ Detector::Result Detector::process(const Tensors& tensors, const Rect& input_rec
     Timer tmr;
     vector<Detection> dv = d->get_detections(_score_threshold, tensors, input_rect.size);
     vector<int32_t> selected = select(_max_detections, dv, _nms, _iou_threshold, _iou_with_min);
+    uint32_t n_threads = d->n_threads();
 
     // Create result with selected detections (ensure the bounding box is inside the image)
     Detector::Result res;
+#if SYNAP_NB_NEON
+    LOGV << "Neon intrinsics will be used for matmul";
+#endif
+    Timer::Duration mmul_dur = 0;
+    bool is_chw = tensors[0].layout() == Layout::nchw;
+    const float* output_1 = tensors.size() == 2 ? tensors[1].as_float() : nullptr;
     const Dim2d zero{0, 0};
     for (auto idx : selected) {
         const Detection& d = dv[idx];
@@ -1075,10 +1338,18 @@ Detector::Result Detector::process(const Tensors& tensors, const Rect& input_rec
                 item.landmarks.push_back(Landmark{l.x, l.y, lm.z, lm.visibility});
             }
         }
+        
+        if (d.mask_data && output_1 != nullptr) {
+            auto t0 = tmr.get();
+            item.mask = compute_masks_parallel(d.mask_data, output_1, n_threads, is_chw);
+            auto t1 = tmr.get();
+            mmul_dur += t1 - t0;
+            if (item.mask.data() == nullptr) LOGE << "Invalid mask";
+        }
         res.items.push_back(item);
     }
     res.success = true;
-
+    LOGV << "Total matmul time: " << mmul_dur << " us";
     LOGV << "Post-processing time: " << tmr;
     LOGV << "Objects detected: " << res.items.size();
     return res;
