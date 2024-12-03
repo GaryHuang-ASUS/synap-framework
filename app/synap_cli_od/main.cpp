@@ -64,7 +64,7 @@ int main(int argc, char* argv[])
     bool iou_with_min = args.has("--iou-with-min", "Use min area instead of union to compute IOU");
     args.check_help("--help", "Show help");
     validate_model_arg(model, nb, meta);
-
+    cout << "[DEBUG] Start to do the example" << endl;
     Preprocessor preprocessor;
     Network network;
     Detector detector(score_threshold, n_max, nms, iou_threshold, iou_with_min);
